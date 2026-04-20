@@ -1,0 +1,82 @@
+name: Build & deploy frontend
+description: |
+  Builds the Next.js frontend with the production API URL baked in, syncs the
+  resulting static export to S3, then invalidates the CloudFront distribution.
+
+inputs:
+  s3_bucket:
+    description: S3 bucket hosting the static frontend (output of stage 7).
+    required: true
+  cloudfront_distribution_id:
+    description: CloudFront distribution ID to invalidate.
+    required: true
+  api_url:
+    description: API Gateway URL for `NEXT_PUBLIC_API_URL`.
+    required: true
+  clerk_publishable_key:
+    description: Clerk publishable key for `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`.
+    required: true
+  invalidation_paths:
+    description: Paths to invalidate in CloudFront (space separated).
+    required: false
+    default: "/*"
+
+runs:
+  using: composite
+  steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        S3_BUCKET: ${{ inputs.s3_bucket }}
+        CF_ID:     ${{ inputs.cloudfront_distribution_id }}
+        API_URL:   ${{ inputs.api_url }}
+      run: |
+        set -euo pipefail
+        missing=()
+        [ -z "${S3_BUCKET}" ] && missing+=("s3_bucket")
+        [ -z "${CF_ID}"     ] && missing+=("cloudfront_distribution_id")
+        [ -z "${API_URL}"   ] && missing+=("api_url")
+        if [ ${#missing[@]} -gt 0 ]; then
+          echo "::error::frontend-deploy received empty value(s) for: ${missing[*]}."
+          echo "::error::These come from terraform/7_frontend outputs (s3_bucket_name, cloudfront_distribution_id, api_gateway_url)."
+          echo "::error::Check the upstream 'api-and-frontend-infra' job's read step — its outputs probably came back empty."
+          exit 1
+        fi
+        # Basic sanity check on bucket name (catches whitespace etc).
+        if ! [[ "${S3_BUCKET}" =~ ^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$ ]]; then
+          echo "::error::s3_bucket value does not look like a valid bucket name: '${S3_BUCKET}'"
+          exit 1
+        fi
+        echo "✓ s3_bucket=${S3_BUCKET}"
+        echo "✓ cloudfront_distribution_id=${CF_ID}"
+
+    - name: npm ci
+      shell: bash
+      working-directory: frontend
+      run: npm ci
+
+    - name: Build (production)
+      shell: bash
+      working-directory: frontend
+      env:
+        NEXT_PUBLIC_API_URL: ${{ inputs.api_url }}
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ inputs.clerk_publishable_key }}
+        NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL: /dashboard
+        NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL: /dashboard
+        NODE_ENV: production
+      run: npm run build
+
+    - name: Sync to S3
+      shell: bash
+      run: |
+        set -euo pipefail
+        aws s3 sync frontend/out/ "s3://${{ inputs.s3_bucket }}/" --delete
+
+    - name: Invalidate CloudFront
+      shell: bash
+      run: |
+        set -euo pipefail
+        aws cloudfront create-invalidation \
+          --distribution-id "${{ inputs.cloudfront_distribution_id }}" \
+          --paths ${{ inputs.invalidation_paths }} \
+          --output text >/dev/null

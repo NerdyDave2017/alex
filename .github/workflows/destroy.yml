@@ -1,0 +1,436 @@
+# ============================================================================
+# Alex CI/CD — destroy
+#
+# Manually-triggered workflow that tears down every AWS resource provisioned
+# by `cicd.yml`, in REVERSE dependency order. Never runs automatically.
+#
+# What it destroys (in order):
+#   1. enterprise              (terraform/8_enterprise)  — dashboards
+#   2. api-and-frontend-infra  (terraform/7_frontend)    — incl. emptying alex-frontend-* bucket first
+#   3. agents                  (terraform/6_agents)      — incl. emptying alex-lambda-packages-* bucket first
+#   4. researcher              (terraform/4_researcher)  — App Runner + ECR (force_delete=true handles images)
+#   5. ingestion               (terraform/3_ingestion)   — incl. emptying alex-vectors-* bucket first
+#   6. database                (terraform/5_database)    — Aurora cluster + secret
+#   7. sagemaker               (terraform/2_sagemaker)   — embedding endpoint
+#
+# What it does NOT touch:
+#   • The Terraform state bucket itself (`alex-terraform-state-<acct>`) —
+#     that's a bootstrap resource managed by `terraform/backend-setup/`.
+#   • The GitHub OIDC role + policies (`terraform/github-oidc/`) —
+#     destroying these would lock CI out of AWS. Tear down separately,
+#     by hand, when you're certain you're done.
+#   • The S3 Vectors namespace — managed outside Terraform.
+#
+# Trigger:
+#   Actions → "Destroy" → Run workflow.
+#   You MUST type the literal string `destroy` into the `confirm` input,
+#   otherwise the gate job fails and nothing runs.
+#
+# Optional `stages` input lets you destroy a subset (comma-separated names
+# from the list above, e.g. `enterprise,frontend`). Skipped stages are
+# left untouched — but be careful: skipping a stage that something
+# downstream depends on can leave that downstream in a broken state.
+# ============================================================================
+
+name: Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" exactly to confirm. Anything else aborts.'
+        type: string
+        required: true
+      stages:
+        description: |
+          Comma-separated subset of stages to destroy. Empty = destroy
+          everything. Names: enterprise,frontend,agents,researcher,
+          ingestion,database,sagemaker
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  # Make sure a destroy never races a deploy on the same ref.
+  group: alex-cicd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write   # OIDC role assumption
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_INPUT: "false"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  # --------------------------------------------------------------------------
+  # gate — refuses to run unless the user typed `destroy` into the confirm
+  # input. Also computes the `should_run_*` flags from the optional stages
+  # subset and exposes them as job outputs.
+  # --------------------------------------------------------------------------
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    outputs:
+      run_enterprise: ${{ steps.flags.outputs.enterprise }}
+      run_frontend:   ${{ steps.flags.outputs.frontend }}
+      run_agents:     ${{ steps.flags.outputs.agents }}
+      run_researcher: ${{ steps.flags.outputs.researcher }}
+      run_ingestion:  ${{ steps.flags.outputs.ingestion }}
+      run_database:   ${{ steps.flags.outputs.database }}
+      run_sagemaker:  ${{ steps.flags.outputs.sagemaker }}
+    steps:
+      - name: Verify confirmation phrase
+        env:
+          CONFIRM: ${{ github.event.inputs.confirm }}
+        run: |
+          if [ "${CONFIRM}" != "destroy" ]; then
+            echo "::error::Confirmation failed. You typed '${CONFIRM}', expected 'destroy'."
+            exit 1
+          fi
+          echo "✓ confirmation accepted."
+
+      - name: Compute per-stage run flags
+        id: flags
+        env:
+          STAGES: ${{ github.event.inputs.stages }}
+        run: |
+          set -euo pipefail
+          all_stages="enterprise frontend agents researcher ingestion database sagemaker"
+          if [ -z "${STAGES}" ]; then
+            for s in $all_stages; do echo "${s}=true" >> "$GITHUB_OUTPUT"; done
+            echo "scope=ALL" >> "$GITHUB_OUTPUT"
+          else
+            # Lower-case + strip whitespace, comma-separate.
+            wanted=$(echo "${STAGES}" | tr '[:upper:],' '[:lower:] ' | tr -s ' ')
+            for s in $all_stages; do
+              if echo " ${wanted} " | grep -qE " ${s} "; then
+                echo "${s}=true"  >> "$GITHUB_OUTPUT"
+              else
+                echo "${s}=false" >> "$GITHUB_OUTPUT"
+              fi
+            done
+            echo "scope=${wanted}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Plan summary
+        run: |
+          {
+            echo "### Destroy plan"
+            echo
+            echo "- confirmation: ✓"
+            echo "- scope: \`${{ steps.flags.outputs.scope }}\`"
+            echo "- enterprise:  \`${{ steps.flags.outputs.enterprise }}\`"
+            echo "- frontend:    \`${{ steps.flags.outputs.frontend }}\`"
+            echo "- agents:      \`${{ steps.flags.outputs.agents }}\`"
+            echo "- researcher:  \`${{ steps.flags.outputs.researcher }}\`"
+            echo "- ingestion:   \`${{ steps.flags.outputs.ingestion }}\`"
+            echo "- database:    \`${{ steps.flags.outputs.database }}\`"
+            echo "- sagemaker:   \`${{ steps.flags.outputs.sagemaker }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # 1. enterprise — no consumers, destroy first.
+  # --------------------------------------------------------------------------
+  enterprise:
+    name: 1 · Destroy enterprise
+    needs: gate
+    if: needs.gate.outputs.run_enterprise == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+      - uses: ./.github/actions/tf-destroy
+        with:
+          stage_dir:    terraform/8_enterprise
+          stage_name:   enterprise
+          state_key:    8_enterprise.tfstate
+          state_bucket: ${{ steps.setup.outputs.state_bucket }}
+          aws_region:   ${{ env.AWS_REGION }}
+          tf_vars_json: '{"aws_region":"${{ env.AWS_REGION }}"}'
+
+  # --------------------------------------------------------------------------
+  # 2. api-and-frontend-infra (terraform/7_frontend)
+  #     • Empty alex-frontend-<acct> first (no force_destroy on the bucket).
+  #     • Same `_ci_remote_state_override.tf` the deploy used so the data
+  #       sources point at S3 instead of the missing local backend.
+  # --------------------------------------------------------------------------
+  frontend:
+    name: 2 · Destroy api + frontend infra
+    needs: [gate, enterprise]
+    if: |
+      always() &&
+      needs.gate.outputs.run_frontend == 'true' &&
+      (needs.enterprise.result == 'success' || needs.enterprise.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Empty frontend bucket
+        uses: ./.github/actions/s3-empty
+        with:
+          bucket: alex-frontend-${{ steps.setup.outputs.account_id }}
+
+      - uses: ./.github/actions/tf-destroy
+        with:
+          stage_dir:    terraform/7_frontend
+          stage_name:   frontend
+          state_key:    7_frontend.tfstate
+          state_bucket: ${{ steps.setup.outputs.state_bucket }}
+          aws_region:   ${{ env.AWS_REGION }}
+          tf_vars_json: |
+            {
+              "aws_region":     "${{ env.AWS_REGION }}",
+              "clerk_jwks_url": "${{ secrets.CLERK_JWKS_URL }}",
+              "clerk_issuer":   "${{ secrets.CLERK_ISSUER }}"
+            }
+          override_files_json: |
+            {
+              "_ci_remote_state_override.tf": "data \"terraform_remote_state\" \"database\" {\n  backend = \"s3\"\n  config = {\n    bucket = \"${{ steps.setup.outputs.state_bucket }}\"\n    key    = \"5_database.tfstate\"\n    region = \"${{ env.AWS_REGION }}\"\n  }\n}\n\ndata \"terraform_remote_state\" \"agents\" {\n  backend = \"s3\"\n  config = {\n    bucket = \"${{ steps.setup.outputs.state_bucket }}\"\n    key    = \"6_agents.tfstate\"\n    region = \"${{ env.AWS_REGION }}\"\n  }\n}\n"
+            }
+
+      - name: Delete frontend-assets snapshot
+        env:
+          STATE_BUCKET: ${{ steps.setup.outputs.state_bucket }}
+        run: |
+          # The deploy pipeline doesn't write a `frontend-assets` snapshot,
+          # but if one ever appears, clean it up here too.
+          aws s3 rm "s3://${STATE_BUCKET}/snapshots/frontend-assets.outputs.json" \
+            --only-show-errors 2>/dev/null || true
+
+  # --------------------------------------------------------------------------
+  # 3. agents (terraform/6_agents)
+  #     Empty alex-lambda-packages-<acct> first.
+  # --------------------------------------------------------------------------
+  agents:
+    name: 3 · Destroy agents
+    needs: [gate, frontend]
+    if: |
+      always() &&
+      needs.gate.outputs.run_agents == 'true' &&
+      (needs.frontend.result == 'success' || needs.frontend.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Empty lambda-packages bucket
+        uses: ./.github/actions/s3-empty
+        with:
+          bucket: alex-lambda-packages-${{ steps.setup.outputs.account_id }}
+
+      # `terraform destroy` for stage 6 references the same TF_VARs the deploy
+      # used. Some are read from earlier-stage outputs in the deploy; for
+      # destroy we just need them to be syntactically present (the resources
+      # being destroyed don't re-validate them), so empty strings are fine.
+      - uses: ./.github/actions/tf-destroy
+        with:
+          stage_dir:    terraform/6_agents
+          stage_name:   agents
+          state_key:    6_agents.tfstate
+          state_bucket: ${{ steps.setup.outputs.state_bucket }}
+          aws_region:   ${{ env.AWS_REGION }}
+          tf_vars_json: |
+            {
+              "aws_region":          "${{ env.AWS_REGION }}",
+              "aurora_cluster_arn":  "destroy-placeholder",
+              "aurora_secret_arn":   "destroy-placeholder",
+              "vector_bucket":       "destroy-placeholder",
+              "sagemaker_endpoint":  "alex-embedding-endpoint",
+              "polygon_api_key":     "${{ secrets.POLYGON_API_KEY }}",
+              "polygon_plan":        "${{ vars.POLYGON_PLAN || 'free' }}",
+              "openai_api_key":      "${{ secrets.OPENAI_API_KEY }}",
+              "openai_model":        "${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}",
+              "langfuse_public_key": "${{ secrets.LANGFUSE_PUBLIC_KEY }}",
+              "langfuse_secret_key": "${{ secrets.LANGFUSE_SECRET_KEY }}",
+              "langfuse_host":       "${{ secrets.LANGFUSE_HOST }}"
+            }
+
+  # --------------------------------------------------------------------------
+  # 4. researcher (terraform/4_researcher)
+  #     ECR has force_delete=true so images are removed automatically.
+  # --------------------------------------------------------------------------
+  researcher:
+    name: 4 · Destroy researcher
+    needs: [gate, agents]
+    if: |
+      always() &&
+      needs.gate.outputs.run_researcher == 'true' &&
+      (needs.agents.result == 'success' || needs.agents.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+      - uses: ./.github/actions/tf-destroy
+        with:
+          stage_dir:    terraform/4_researcher
+          stage_name:   researcher
+          state_key:    4_researcher.tfstate
+          state_bucket: ${{ steps.setup.outputs.state_bucket }}
+          aws_region:   ${{ env.AWS_REGION }}
+          tf_vars_json: |
+            {
+              "aws_region":        "${{ env.AWS_REGION }}",
+              "openai_api_key":    "${{ secrets.OPENAI_API_KEY }}",
+              "openai_model":      "${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}",
+              "alex_api_endpoint": "destroy-placeholder",
+              "alex_api_key":      "destroy-placeholder",
+              "scheduler_enabled": "false"
+            }
+
+  # --------------------------------------------------------------------------
+  # 5. ingestion (terraform/3_ingestion)
+  #     Empty alex-vectors-<acct> first.
+  # --------------------------------------------------------------------------
+  ingestion:
+    name: 5 · Destroy ingestion
+    needs: [gate, researcher]
+    if: |
+      always() &&
+      needs.gate.outputs.run_ingestion == 'true' &&
+      (needs.researcher.result == 'success' || needs.researcher.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Empty vectors bucket
+        uses: ./.github/actions/s3-empty
+        with:
+          bucket: alex-vectors-${{ steps.setup.outputs.account_id }}
+
+      - uses: ./.github/actions/tf-destroy
+        with:
+          stage_dir:    terraform/3_ingestion
+          stage_name:   ingestion
+          state_key:    3_ingestion.tfstate
+          state_bucket: ${{ steps.setup.outputs.state_bucket }}
+          aws_region:   ${{ env.AWS_REGION }}
+          tf_vars_json: |
+            {
+              "aws_region":              "${{ env.AWS_REGION }}",
+              "sagemaker_endpoint_name": "alex-embedding-endpoint"
+            }
+
+  # --------------------------------------------------------------------------
+  # 6. database (terraform/5_database)
+  # --------------------------------------------------------------------------
+  database:
+    name: 6 · Destroy database
+    needs: [gate, ingestion]
+    if: |
+      always() &&
+      needs.gate.outputs.run_database == 'true' &&
+      (needs.ingestion.result == 'success' || needs.ingestion.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+      - uses: ./.github/actions/tf-destroy
+        with:
+          stage_dir:    terraform/5_database
+          stage_name:   database
+          state_key:    5_database.tfstate
+          state_bucket: ${{ steps.setup.outputs.state_bucket }}
+          aws_region:   ${{ env.AWS_REGION }}
+          tf_vars_json: |
+            {
+              "aws_region":  "${{ env.AWS_REGION }}",
+              "min_capacity": "${{ vars.DB_MIN_ACU || '0.5' }}",
+              "max_capacity": "${{ vars.DB_MAX_ACU || '1' }}"
+            }
+
+  # --------------------------------------------------------------------------
+  # 7. sagemaker (terraform/2_sagemaker) — destroy last.
+  # --------------------------------------------------------------------------
+  sagemaker:
+    name: 7 · Destroy sagemaker
+    needs: [gate, database]
+    if: |
+      always() &&
+      needs.gate.outputs.run_sagemaker == 'true' &&
+      (needs.database.result == 'success' || needs.database.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+      - uses: ./.github/actions/tf-destroy
+        with:
+          stage_dir:    terraform/2_sagemaker
+          stage_name:   sagemaker
+          state_key:    2_sagemaker.tfstate
+          state_bucket: ${{ steps.setup.outputs.state_bucket }}
+          aws_region:   ${{ env.AWS_REGION }}
+          tf_vars_json: '{"aws_region":"${{ env.AWS_REGION }}"}'
+
+  # --------------------------------------------------------------------------
+  # Final summary — convenient single status for visibility.
+  # --------------------------------------------------------------------------
+  summary:
+    name: Summary
+    if: always()
+    needs: [gate, enterprise, frontend, agents, researcher, ingestion, database, sagemaker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate
+        shell: bash
+        run: |
+          echo "### Destroy summary"           >> "$GITHUB_STEP_SUMMARY"
+          echo                                  >> "$GITHUB_STEP_SUMMARY"
+          printf "| stage | result |\n|---|---|\n" >> "$GITHUB_STEP_SUMMARY"
+          for s in enterprise frontend agents researcher ingestion database sagemaker; do
+            r=$(jq -r --arg s "$s" '.[$s].result // "skipped"' <<<'${{ toJson(needs) }}')
+            printf "| %s | %s |\n" "$s" "$r" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          fail=0
+          for s in enterprise frontend agents researcher ingestion database sagemaker; do
+            r=$(jq -r --arg s "$s" '.[$s].result // "skipped"' <<<'${{ toJson(needs) }}')
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then fail=1; fi
+          done
+          exit $fail

@@ -1,0 +1,59 @@
+name: Run database migrations
+description: |
+  Applies the SQL migrations under `backend/database/migrations` to the
+  Aurora cluster via the Data API. Idempotent (migrations are tracked
+  inside `run_migrations.py`).
+
+inputs:
+  aurora_cluster_arn:
+    description: ARN of the Aurora cluster (output `aurora_cluster_arn` of stage 5).
+    required: true
+  aurora_secret_arn:
+    description: ARN of the Aurora credentials secret (output `aurora_secret_arn` of stage 5).
+    required: true
+  aws_region:
+    description: AWS region of the cluster.
+    required: true
+  database_name:
+    description: Database name (defaults to `alex`, matches stage 5 default).
+    required: false
+    default: alex
+  seed:
+    description: Set to "true" to also run `seed_data.py` (loads the 22 reference ETFs).
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Run migrations
+      shell: bash
+      working-directory: backend/database
+      env:
+        AURORA_CLUSTER_ARN: ${{ inputs.aurora_cluster_arn }}
+        AURORA_SECRET_ARN: ${{ inputs.aurora_secret_arn }}
+        AURORA_DATABASE: ${{ inputs.database_name }}
+        AWS_REGION: ${{ inputs.aws_region }}
+        DEFAULT_AWS_REGION: ${{ inputs.aws_region }}
+      run: |
+        set -euo pipefail
+        uv sync
+        echo "::group::run_migrations.py"
+        uv run run_migrations.py
+        echo "::endgroup::"
+
+    - name: Seed reference data
+      if: inputs.seed == 'true'
+      shell: bash
+      working-directory: backend/database
+      env:
+        AURORA_CLUSTER_ARN: ${{ inputs.aurora_cluster_arn }}
+        AURORA_SECRET_ARN: ${{ inputs.aurora_secret_arn }}
+        AURORA_DATABASE: ${{ inputs.database_name }}
+        AWS_REGION: ${{ inputs.aws_region }}
+        DEFAULT_AWS_REGION: ${{ inputs.aws_region }}
+      run: |
+        set -euo pipefail
+        echo "::group::seed_data.py"
+        uv run seed_data.py
+        echo "::endgroup::"

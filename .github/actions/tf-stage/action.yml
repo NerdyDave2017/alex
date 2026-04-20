@@ -1,0 +1,219 @@
+name: Terraform stage
+description: |
+  Runs `terraform init` against the shared S3 backend, `plan -detailed-exitcode`
+  to detect actual changes, conditionally `apply`, then captures outputs and
+  compares them to the previous snapshot stored in S3
+  (`s3://<state_bucket>/snapshots/<stage_name>.outputs.json`).
+
+  Surfaces two cascade signals as composite outputs:
+    - applied         → "true" iff terraform apply ran (plan exit code 2)
+    - outputs_changed → "true" iff captured outputs differ from the previous snapshot
+  Plus the full outputs JSON so callers can extract specific values.
+
+inputs:
+  stage_dir:
+    description: Path to the Terraform stage directory (e.g. terraform/5_database).
+    required: true
+  stage_name:
+    description: Short stage identifier used for the state key and snapshot file.
+    required: true
+  state_key:
+    description: Object key for the tfstate file in the state bucket.
+    required: true
+  state_bucket:
+    description: S3 bucket holding tfstate and output snapshots.
+    required: true
+  aws_region:
+    description: Region of the state bucket and provider.
+    required: true
+  apply:
+    description: Set to "false" to plan only (e.g. on pull requests).
+    required: false
+    default: "true"
+  tf_vars_json:
+    description: |
+      JSON object of TF_VAR_<name>=<value> values to inject into the
+      Terraform run as environment variables.
+    required: false
+    default: "{}"
+  override_files_json:
+    description: |
+      Optional JSON map of relative-path → file contents to write into the
+      stage directory before init (e.g. for terraform_remote_state overrides).
+    required: false
+    default: "{}"
+  exclude_outputs:
+    description: |
+      Comma-separated list of top-level Terraform output names to strip from
+      the `outputs_json` exposed by this action AND from the snapshot uploaded
+      to S3. Local `terraform apply` / `terraform output` still shows them in
+      full; only the CI side is filtered. Default removes `setup_instructions`
+      (a human-facing help string that contains apostrophes / quotes / newlines
+      that can confuse shell parsers and that nothing downstream consumes).
+    required: false
+    default: "setup_instructions"
+
+outputs:
+  applied:
+    description: "true if terraform apply ran during this invocation."
+    value: ${{ steps.summary.outputs.applied }}
+  outputs_changed:
+    description: "true if the outputs differ from the previous snapshot (or no prior snapshot exists)."
+    value: ${{ steps.summary.outputs.outputs_changed }}
+  outputs_json:
+    description: Current Terraform outputs as a JSON string.
+    value: ${{ steps.capture.outputs.json }}
+
+runs:
+  using: composite
+  steps:
+    - name: Write override files
+      if: inputs.override_files_json != '{}'
+      shell: bash
+      working-directory: ${{ inputs.stage_dir }}
+      env:
+        OVERRIDES: ${{ inputs.override_files_json }}
+      run: |
+        set -euo pipefail
+        echo "$OVERRIDES" | jq -r 'to_entries[] | @base64' | while read -r row; do
+          path=$(echo "$row" | base64 --decode | jq -r '.key')
+          content=$(echo "$row" | base64 --decode | jq -r '.value')
+          mkdir -p "$(dirname "$path")"
+          printf '%s' "$content" > "$path"
+          echo "wrote override: ${{ inputs.stage_dir }}/${path}"
+        done
+
+    - name: Inject TF_VAR_* env from JSON
+      shell: bash
+      env:
+        TF_VARS_JSON: ${{ inputs.tf_vars_json }}
+      run: |
+        set -euo pipefail
+        # Each key in the JSON becomes TF_VAR_<key>=<value>. Booleans/numbers are passed through as strings.
+        echo "$TF_VARS_JSON" | jq -r 'to_entries[] | "TF_VAR_\(.key)=\(.value|tostring)"' >> "$GITHUB_ENV"
+
+    - name: Terraform init
+      shell: bash
+      working-directory: ${{ inputs.stage_dir }}
+      run: |
+        set -euo pipefail
+        terraform init -input=false -reconfigure \
+          -backend-config="bucket=${{ inputs.state_bucket }}" \
+          -backend-config="key=${{ inputs.state_key }}" \
+          -backend-config="region=${{ inputs.aws_region }}"
+
+    - name: Terraform plan
+      id: plan
+      shell: bash
+      working-directory: ${{ inputs.stage_dir }}
+      run: |
+        set +e
+        terraform plan -input=false -lock-timeout=5m -detailed-exitcode -out=tfplan
+        ec=$?
+        set -e
+        echo "exit_code=${ec}" >> "$GITHUB_OUTPUT"
+        case "$ec" in
+          0) echo "no changes detected"; echo "no_changes=true"  >> "$GITHUB_OUTPUT" ;;
+          2) echo "changes detected";    echo "no_changes=false" >> "$GITHUB_OUTPUT" ;;
+          *) echo "plan failed with exit code $ec"; exit "$ec" ;;
+        esac
+
+    - name: Terraform apply
+      if: steps.plan.outputs.no_changes == 'false' && inputs.apply == 'true'
+      shell: bash
+      working-directory: ${{ inputs.stage_dir }}
+      run: terraform apply -input=false -lock-timeout=5m tfplan
+
+    - name: Capture current outputs
+      id: capture
+      shell: bash
+      working-directory: ${{ inputs.stage_dir }}
+      env:
+        EXCLUDE_OUTPUTS: ${{ inputs.exclude_outputs }}
+      run: |
+        set -euo pipefail
+        terraform output -json > /tmp/outputs-raw.json
+
+        # Drop top-level keys listed in EXCLUDE_OUTPUTS. Default strips
+        # `setup_instructions` (human-facing help string, not consumed
+        # downstream and contains shell-hostile characters). Local
+        # `terraform output` still shows the full set.
+        if [ -n "${EXCLUDE_OUTPUTS}" ]; then
+          jq -cS --arg keys "${EXCLUDE_OUTPUTS}" '
+            ($keys | split(",") | map(select(length > 0))) as $remove
+            | with_entries(select(.key as $k | ($remove | index($k)) | not))
+          ' /tmp/outputs-raw.json > /tmp/outputs-curr.json
+        else
+          jq -cS . /tmp/outputs-raw.json > /tmp/outputs-curr.json
+        fi
+
+        # Diagnostic — print which top-level keys were dropped (if any).
+        removed=$(jq -r -n \
+          --slurpfile a /tmp/outputs-raw.json \
+          --slurpfile b /tmp/outputs-curr.json \
+          '($a[0] | keys) - ($b[0] | keys) | join(", ")')
+        if [ -n "$removed" ]; then
+          echo "::notice::tf-stage stripped outputs from CI payload: ${removed}"
+        fi
+
+        {
+          echo "json<<__TFOUT_EOF__"
+          cat /tmp/outputs-curr.json
+          echo
+          echo "__TFOUT_EOF__"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Compare to previous snapshot in S3
+      id: diff
+      shell: bash
+      env:
+        STATE_BUCKET: ${{ inputs.state_bucket }}
+        STAGE_NAME: ${{ inputs.stage_name }}
+      run: |
+        set -euo pipefail
+        snapshot_uri="s3://${STATE_BUCKET}/snapshots/${STAGE_NAME}.outputs.json"
+        if aws s3 cp "${snapshot_uri}" /tmp/outputs-prev.json --only-show-errors 2>/dev/null; then
+          if diff -q /tmp/outputs-prev.json /tmp/outputs-curr.json >/dev/null 2>&1; then
+            echo "outputs unchanged"
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "outputs changed"
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          fi
+        else
+          echo "no previous snapshot — treating as changed (first deploy)"
+          echo "value=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Save snapshot to S3
+      if: steps.plan.outputs.no_changes == 'false' && inputs.apply == 'true'
+      shell: bash
+      env:
+        STATE_BUCKET: ${{ inputs.state_bucket }}
+        STAGE_NAME: ${{ inputs.stage_name }}
+      run: |
+        set -euo pipefail
+        aws s3 cp /tmp/outputs-curr.json \
+          "s3://${STATE_BUCKET}/snapshots/${STAGE_NAME}.outputs.json" \
+          --only-show-errors
+
+    - name: Summarise
+      id: summary
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "${{ steps.plan.outputs.no_changes }}" = "false" ] && [ "${{ inputs.apply }}" = "true" ]; then
+          applied=true
+        else
+          applied=false
+        fi
+        echo "applied=${applied}"                              >> "$GITHUB_OUTPUT"
+        echo "outputs_changed=${{ steps.diff.outputs.value }}" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### Terraform · ${{ inputs.stage_name }}"
+          echo
+          echo "- plan exit code: \`${{ steps.plan.outputs.exit_code }}\`"
+          echo "- applied: \`${applied}\`"
+          echo "- outputs_changed: \`${{ steps.diff.outputs.value }}\`"
+        } >> "$GITHUB_STEP_SUMMARY"

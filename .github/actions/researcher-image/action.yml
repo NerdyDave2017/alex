@@ -1,0 +1,156 @@
+name: Build & push researcher image
+description: |
+  Builds the researcher Docker image (linux/amd64), pushes to ECR with a unique
+  tag and `latest`, then triggers an App Runner deployment to roll the running
+  service onto the new image. Mirrors `backend/researcher/deploy.py` for CI.
+
+inputs:
+  ecr_repository_url:
+    description: ECR repository URL (output of `terraform/4_researcher` `ecr_repository_url`).
+    required: true
+  ecr_repository_name:
+    description: ECR repository name (defaults to `alex-researcher`).
+    required: false
+    default: alex-researcher
+  app_runner_service_name:
+    description: App Runner service name to redeploy after push.
+    required: false
+    default: alex-researcher
+  aws_region:
+    description: AWS region for ECR and App Runner.
+    required: true
+
+outputs:
+  image_tag:
+    description: The unique image tag pushed to ECR.
+    value: ${{ steps.tag.outputs.value }}
+
+runs:
+  using: composite
+  steps:
+    - name: Compute image tag
+      id: tag
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Stable across retries within the same workflow run; unique across runs.
+        ts=$(date -u +%Y%m%d%H%M%S)
+        echo "value=ci-${{ github.run_number }}-${ts}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build and push image
+      uses: docker/build-push-action@v6
+      with:
+        context: backend/researcher
+        file: backend/researcher/Dockerfile
+        platforms: linux/amd64
+        push: true
+        tags: |
+          ${{ inputs.ecr_repository_url }}:${{ steps.tag.outputs.value }}
+          ${{ inputs.ecr_repository_url }}:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Trigger App Runner deployment
+      shell: bash
+      env:
+        REGION: ${{ inputs.aws_region }}
+        SERVICE_NAME: ${{ inputs.app_runner_service_name }}
+      run: |
+        set -euo pipefail
+
+        service_arn=$(aws apprunner list-services --region "$REGION" \
+          --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceArn | [0]" \
+          --output text)
+
+        # Case 1: service doesn't exist yet (e.g. first deploy — terraform
+        # creates it after this action). Image is already in ECR; nothing
+        # else to do here.
+        if [ -z "$service_arn" ] || [ "$service_arn" = "None" ]; then
+          echo "::notice::App Runner service '${SERVICE_NAME}' not found yet — image pushed to ECR; terraform will create the service in the next step."
+          exit 0
+        fi
+
+        # Case 2: service exists. Inspect status. `start-deployment` only
+        # works while the service is RUNNING — anything else (CREATE_FAILED,
+        # OPERATION_IN_PROGRESS, PAUSED, DELETED, …) must be handled.
+        # We wait briefly for OPERATION_IN_PROGRESS to settle, but for any
+        # terminal-bad state we skip the redeploy and let the downstream
+        # `terraform apply` reconcile (it'll force-replace a CREATE_FAILED
+        # service via the `replace_triggered_by`/lifecycle policy).
+        wait_for_steady() {
+          for i in $(seq 1 60); do
+            s=$(aws apprunner describe-service --region "$REGION" \
+                  --service-arn "$service_arn" \
+                  --query 'Service.Status' --output text 2>/dev/null || echo "UNKNOWN")
+            if [ "$s" != "OPERATION_IN_PROGRESS" ]; then
+              echo "$s"
+              return 0
+            fi
+            sleep 5
+          done
+          echo "OPERATION_IN_PROGRESS"
+        }
+
+        status=$(wait_for_steady)
+        echo "App Runner status: $status"
+
+        case "$status" in
+          RUNNING)
+            echo "Triggering deployment for ${service_arn}"
+            aws apprunner start-deployment \
+              --region "$REGION" \
+              --service-arn "$service_arn" \
+              --output text >/dev/null
+            ;;
+          CREATE_FAILED)
+            echo "::warning::App Runner is in CREATE_FAILED — skipping redeploy. The next \`terraform apply\` will force-replace the service so it can pull the freshly-pushed image."
+            exit 0
+            ;;
+          DELETED|DELETE_FAILED|PAUSED)
+            echo "::warning::App Runner is in ${status} — skipping redeploy. Reconcile manually or via terraform."
+            exit 0
+            ;;
+          OPERATION_IN_PROGRESS)
+            echo "::warning::App Runner still in OPERATION_IN_PROGRESS after wait — skipping redeploy this run."
+            exit 0
+            ;;
+          *)
+            echo "::warning::Unexpected App Runner status: ${status} — skipping redeploy."
+            exit 0
+            ;;
+        esac
+
+        echo "Waiting for deployment to reach RUNNING (timeout ~10m)…"
+        for i in $(seq 1 120); do
+          status=$(aws apprunner describe-service --region "$REGION" \
+            --service-arn "$service_arn" \
+            --query 'Service.Status' --output text)
+          case "$status" in
+            RUNNING) echo "✓ App Runner is RUNNING"; exit 0 ;;
+            OPERATION_IN_PROGRESS) ;;
+            CREATE_FAILED|DELETE_FAILED)
+              echo "::error::Deployment ended in ${status}. Check App Runner logs in the AWS console." >&2
+              exit 1
+              ;;
+            *) echo "status: $status" ;;
+          esac
+          sleep 5
+        done
+        echo "::error::Deployment did not reach RUNNING in time — check AWS Console." >&2
+        exit 1
+
+    - name: Summarise
+      shell: bash
+      run: |
+        {
+          echo "### Researcher image"
+          echo
+          echo "- repository: \`${{ inputs.ecr_repository_url }}\`"
+          echo "- tag: \`${{ steps.tag.outputs.value }}\`"
+        } >> "$GITHUB_STEP_SUMMARY"

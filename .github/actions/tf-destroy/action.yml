@@ -1,0 +1,136 @@
+name: Terraform destroy
+description: |
+  Mirror of `tf-stage`, but runs `terraform destroy` instead of `apply`.
+
+  Steps:
+    1. Optionally write override files into the stage dir (e.g. CI-only
+       remote_state overrides used by the deploy pipeline).
+    2. Inject `tf_vars_json` as `TF_VAR_<key>=<value>` env vars.
+    3. `terraform init` against the shared S3 backend.
+    4. `terraform destroy -auto-approve`.
+    5. Delete the stage's outputs snapshot from S3
+       (`s3://<state_bucket>/snapshots/<stage_name>.outputs.json`) so a
+       re-deploy is treated as a first-deploy.
+
+  Tolerant: if the state file is empty (stage was never deployed) `destroy`
+  is a no-op. The snapshot deletion is also no-op when the snapshot is missing.
+
+inputs:
+  stage_dir:
+    description: Path to the Terraform stage directory (e.g. terraform/5_database).
+    required: true
+  stage_name:
+    description: Short stage identifier matching the deploy pipeline.
+    required: true
+  state_key:
+    description: Object key for the tfstate file in the state bucket.
+    required: true
+  state_bucket:
+    description: S3 bucket holding tfstate and output snapshots.
+    required: true
+  aws_region:
+    description: Region of the state bucket and provider.
+    required: true
+  tf_vars_json:
+    description: |
+      JSON object of TF_VAR_<name>=<value> values to inject. Must include
+      every variable the stage's resources reference, otherwise destroy will
+      prompt for missing values and fail under `-input=false`.
+    required: false
+    default: "{}"
+  override_files_json:
+    description: |
+      Optional JSON map of relative-path → file contents to write into the
+      stage directory before init. Use the same overrides the deploy used
+      (e.g. the `_ci_remote_state_override.tf` for stage 7).
+    required: false
+    default: "{}"
+  delete_snapshot:
+    description: Set to "false" to keep the outputs snapshot in S3.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Write override files
+      if: inputs.override_files_json != '{}'
+      shell: bash
+      working-directory: ${{ inputs.stage_dir }}
+      env:
+        OVERRIDES: ${{ inputs.override_files_json }}
+      run: |
+        set -euo pipefail
+        echo "$OVERRIDES" | jq -r 'to_entries[] | @base64' | while read -r row; do
+          path=$(echo "$row" | base64 --decode | jq -r '.key')
+          content=$(echo "$row" | base64 --decode | jq -r '.value')
+          mkdir -p "$(dirname "$path")"
+          printf '%s' "$content" > "$path"
+          echo "wrote override: ${{ inputs.stage_dir }}/${path}"
+        done
+
+    - name: Inject TF_VAR_* env from JSON
+      shell: bash
+      env:
+        TF_VARS_JSON: ${{ inputs.tf_vars_json }}
+      run: |
+        set -euo pipefail
+        echo "$TF_VARS_JSON" | jq -r 'to_entries[] | "TF_VAR_\(.key)=\(.value|tostring)"' >> "$GITHUB_ENV"
+
+    - name: Terraform init
+      shell: bash
+      working-directory: ${{ inputs.stage_dir }}
+      run: |
+        set -euo pipefail
+        terraform init -input=false -reconfigure \
+          -backend-config="bucket=${{ inputs.state_bucket }}" \
+          -backend-config="key=${{ inputs.state_key }}" \
+          -backend-config="region=${{ inputs.aws_region }}"
+
+    - name: Show what will be destroyed
+      shell: bash
+      working-directory: ${{ inputs.stage_dir }}
+      run: |
+        set -euo pipefail
+        # `state list` returns non-zero on empty/missing state; treat as no-op.
+        if terraform state list >/tmp/state.txt 2>/dev/null && [ -s /tmp/state.txt ]; then
+          count=$(wc -l < /tmp/state.txt | tr -d ' ')
+          echo "::group::Resources to destroy (${count})"
+          cat /tmp/state.txt
+          echo "::endgroup::"
+        else
+          echo "::notice::no resources in state — destroy will be a no-op."
+        fi
+
+    - name: Terraform destroy
+      shell: bash
+      working-directory: ${{ inputs.stage_dir }}
+      run: |
+        set -euo pipefail
+        terraform destroy -input=false -auto-approve -lock-timeout=10m
+
+    - name: Delete outputs snapshot from S3
+      if: inputs.delete_snapshot == 'true'
+      shell: bash
+      env:
+        STATE_BUCKET: ${{ inputs.state_bucket }}
+        STAGE_NAME: ${{ inputs.stage_name }}
+      run: |
+        set -euo pipefail
+        key="snapshots/${STAGE_NAME}.outputs.json"
+        if aws s3api head-object --bucket "${STATE_BUCKET}" --key "${key}" >/dev/null 2>&1; then
+          aws s3 rm "s3://${STATE_BUCKET}/${key}" --only-show-errors
+          echo "✓ deleted snapshot s3://${STATE_BUCKET}/${key}"
+        else
+          echo "::notice::no snapshot to delete (s3://${STATE_BUCKET}/${key})."
+        fi
+
+    - name: Summarise
+      shell: bash
+      run: |
+        {
+          echo "### Terraform destroy · ${{ inputs.stage_name }}"
+          echo
+          echo "- stage_dir: \`${{ inputs.stage_dir }}\`"
+          echo "- state_key: \`${{ inputs.state_key }}\`"
+        } >> "$GITHUB_STEP_SUMMARY"

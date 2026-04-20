@@ -1,0 +1,912 @@
+# ============================================================================
+# Alex CI/CD — 7 stages, one job per Terraform folder.
+#
+# Stages map 1:1 to `terraform/<n>_<name>/` and the corresponding `guides/`:
+#   1. SageMaker          (terraform/2_sagemaker)
+#   2. Database           (terraform/5_database)            ┐ run in parallel
+#   3. Ingestion          (terraform/3_ingestion)           │ with each other
+#   4. Researcher (image+infra) (terraform/4_researcher)    ┘
+#   5. Agents             (terraform/6_agents)
+#   6. API + Frontend infra (terraform/7_frontend)
+#   7. Frontend assets    (S3 sync + CloudFront invalidation)
+#
+# (terraform/8_enterprise — observability dashboards — is intentionally
+#  excluded from CI for now; deploy it manually when needed.)
+#
+# Cascade rules:
+#   • Each stage runs only when its own paths changed (dorny/paths-filter),
+#     OR an upstream stage's outputs actually changed (snapshot diff in S3),
+#     OR the workflow was dispatched with `full=true`.
+#   • PRs run plan only (no apply, no asset publish, no docker push).
+#   • main runs the full pipeline with apply.
+#
+# Required GitHub secrets (Settings → Secrets → Actions):
+#   AWS_ROLE_ARN            ARN of the IAM role assumed via GitHub OIDC.
+#                           No long-lived AWS keys needed. The role's trust
+#                           policy must trust `token.actions.githubusercontent.com`
+#                           and (typically) restrict by `repo:<owner>/<repo>:*`.
+#                           If you really must use static keys instead, set
+#                           AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY and the
+#                           setup action will fall back to them automatically.
+#   OPENAI_API_KEY
+#   POLYGON_API_KEY
+#   CLERK_JWKS_URL
+#   CLERK_PUBLISHABLE_KEY
+#   (optional) LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST
+#
+# Required GitHub variables (Settings → Variables → Actions):
+#   AWS_REGION              e.g. us-east-1   (must match the state bucket region)
+#   OPENAI_MODEL            e.g. gpt-4o-mini (passed to researcher + every agent Lambda via LiteLLM)
+#   POLYGON_PLAN            free | paid
+#   DB_MIN_ACU              e.g. 0.5
+#   DB_MAX_ACU              e.g. 1
+#   CLERK_ISSUER            (may be empty)
+#
+# One-time prerequisites (NOT in CI):
+#   • IAM groups & policies (Guide 1)
+#   • S3 Vectors namespace bucket (Guide 3 — different namespace from regular S3)
+#   • An OpenAI API key (and optional compatible base URL) stored as secrets
+#   • `terraform/backend-setup` applied once to create the S3 state bucket
+#     `alex-terraform-state-<accountId>` (this workflow stores tfstate AND
+#     output snapshots in that same bucket).
+# ============================================================================
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Force every stage to run regardless of file changes"
+        type: boolean
+        default: false
+      stages:
+        description: "Comma-separated subset to run (e.g. 'database,agents'). Empty = all eligible."
+        type: string
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false  # never cancel a deploy in flight
+
+permissions:
+  contents: read
+  id-token: write   # required for AWS OIDC (configure-aws-credentials assumes AWS_ROLE_ARN)
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_INPUT: "false"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  # --------------------------------------------------------------------------
+  # changes — single source of truth for "what touched what" path filtering.
+  # --------------------------------------------------------------------------
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      sagemaker:        ${{ steps.f.outputs.sagemaker }}
+      database_tf:      ${{ steps.f.outputs.database_tf }}
+      database_sql:     ${{ steps.f.outputs.database_sql }}
+      ingest:           ${{ steps.f.outputs.ingest }}
+      researcher_code:  ${{ steps.f.outputs.researcher_code }}
+      researcher_tf:    ${{ steps.f.outputs.researcher_tf }}
+      agents_tf:        ${{ steps.f.outputs.agents_tf }}
+      agent_planner:    ${{ steps.f.outputs.agent_planner }}
+      agent_tagger:     ${{ steps.f.outputs.agent_tagger }}
+      agent_reporter:   ${{ steps.f.outputs.agent_reporter }}
+      agent_charter:    ${{ steps.f.outputs.agent_charter }}
+      agent_retirement: ${{ steps.f.outputs.agent_retirement }}
+      api:              ${{ steps.f.outputs.api }}
+      frontend_tf:      ${{ steps.f.outputs.frontend_tf }}
+      frontend_assets:  ${{ steps.f.outputs.frontend_assets }}
+      shared_backend:   ${{ steps.f.outputs.shared_backend }}
+      ci_self:          ${{ steps.f.outputs.ci_self }}
+      full:             ${{ steps.flags.outputs.full }}
+      apply:            ${{ steps.flags.outputs.apply }}
+      stages:           ${{ steps.flags.outputs.stages }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Compute pipeline flags
+        id: flags
+        env:
+          DISPATCH_FULL: ${{ github.event.inputs.full }}
+          DISPATCH_STAGES: ${{ github.event.inputs.stages }}
+        run: |
+          # full = explicit "force every stage" (workflow_dispatch input)
+          if [ "${DISPATCH_FULL:-false}" = "true" ]; then full=true; else full=false; fi
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+
+          # apply = "actually run terraform apply / publish artifacts"
+          # PRs are plan-only; main-pushes and manual dispatches apply.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then apply=false
+          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then apply=true
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then apply=true
+          else apply=false
+          fi
+          echo "apply=$apply" >> "$GITHUB_OUTPUT"
+
+          # stages = explicit subset filter (empty string when not set)
+          echo "stages=${DISPATCH_STAGES:-}" >> "$GITHUB_OUTPUT"
+
+      - id: f
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            sagemaker:
+              - 'terraform/2_sagemaker/**'
+            database_tf:
+              - 'terraform/5_database/**'
+            database_sql:
+              - 'backend/database/migrations/**'
+              - 'backend/database/seed_data.py'
+              - 'backend/database/run_migrations.py'
+              - 'backend/database/src/**'
+            ingest:
+              - 'backend/ingest/**'
+              - 'terraform/3_ingestion/**'
+            researcher_code:
+              - 'backend/researcher/**'
+            researcher_tf:
+              - 'terraform/4_researcher/**'
+            agents_tf:
+              - 'terraform/6_agents/**'
+            agent_planner:    [ 'backend/planner/**' ]
+            agent_tagger:     [ 'backend/tagger/**' ]
+            agent_reporter:   [ 'backend/reporter/**' ]
+            agent_charter:    [ 'backend/charter/**' ]
+            agent_retirement: [ 'backend/retirement/**' ]
+            api:
+              - 'backend/api/**'
+            frontend_tf:
+              - 'terraform/7_frontend/**'
+            frontend_assets:
+              - 'frontend/**'
+            shared_backend:
+              - 'backend/pyproject.toml'
+              - 'backend/uv.lock'
+              - 'backend/common/**'
+            ci_self:
+              - '.github/**'
+
+  # --------------------------------------------------------------------------
+  # 1. SageMaker — embedding endpoint. No upstream.
+  # --------------------------------------------------------------------------
+  sagemaker:
+    name: 1 · SageMaker
+    needs: changes
+    if: |
+      !cancelled() && (
+        needs.changes.outputs.sagemaker == 'true' ||
+        needs.changes.outputs.ci_self  == 'true' ||
+        needs.changes.outputs.full     == 'true' ||
+        contains(needs.changes.outputs.stages, 'sagemaker')
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      applied:                   ${{ steps.tf.outputs.applied }}
+      outputs_changed:           ${{ steps.tf.outputs.outputs_changed }}
+      sagemaker_endpoint_name:   ${{ steps.read.outputs.sagemaker_endpoint_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+      - id: tf
+        uses: ./.github/actions/tf-stage
+        with:
+          stage_dir:    terraform/2_sagemaker
+          stage_name:   sagemaker
+          state_key:    2_sagemaker.tfstate
+          state_bucket: ${{ steps.setup.outputs.state_bucket }}
+          aws_region:   ${{ env.AWS_REGION }}
+          apply:        ${{ needs.changes.outputs.apply }}
+          tf_vars_json: '{"aws_region":"${{ env.AWS_REGION }}"}'
+      - id: read
+        shell: bash
+        env:
+          # Pass JSON via env (NOT ${{ }} shell interpolation) so apostrophes
+          # / newlines / quotes inside Terraform string outputs (e.g.
+          # `setup_instructions`) can't break the shell parser.
+          OUT_JSON: ${{ steps.tf.outputs.outputs_json }}
+        run: |
+          set -euo pipefail
+          name=$(printf '%s' "$OUT_JSON" | jq -r '.sagemaker_endpoint_name.value // "alex-embedding-endpoint"')
+          echo "sagemaker_endpoint_name=${name}" >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------------------------
+  # 2. Database — Aurora Serverless v2 + migrations + seed.
+  # --------------------------------------------------------------------------
+  database:
+    name: 2 · Database
+    needs: changes
+    if: |
+      !cancelled() && (
+        needs.changes.outputs.database_tf  == 'true' ||
+        needs.changes.outputs.database_sql == 'true' ||
+        needs.changes.outputs.ci_self      == 'true' ||
+        needs.changes.outputs.full         == 'true' ||
+        contains(needs.changes.outputs.stages, 'database')
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      applied:            ${{ steps.tf.outputs.applied }}
+      outputs_changed:    ${{ steps.tf.outputs.outputs_changed }}
+      aurora_cluster_arn: ${{ steps.read.outputs.aurora_cluster_arn }}
+      aurora_secret_arn:  ${{ steps.read.outputs.aurora_secret_arn }}
+      database_name:      ${{ steps.read.outputs.database_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+          install-uv:            "true"
+      - id: tf
+        uses: ./.github/actions/tf-stage
+        with:
+          stage_dir:    terraform/5_database
+          stage_name:   database
+          state_key:    5_database.tfstate
+          state_bucket: ${{ steps.setup.outputs.state_bucket }}
+          aws_region:   ${{ env.AWS_REGION }}
+          apply:        ${{ needs.changes.outputs.apply }}
+          tf_vars_json: |
+            {
+              "aws_region":  "${{ env.AWS_REGION }}",
+              "min_capacity": "${{ vars.DB_MIN_ACU || '0.5' }}",
+              "max_capacity": "${{ vars.DB_MAX_ACU || '1' }}"
+            }
+      - id: read
+        shell: bash
+        env:
+          OUT_JSON: ${{ steps.tf.outputs.outputs_json }}
+        run: |
+          set -euo pipefail
+          j=$(printf '%s' "$OUT_JSON")
+          echo "aurora_cluster_arn=$(echo "$j" | jq -r '.aurora_cluster_arn.value // empty')" >> "$GITHUB_OUTPUT"
+          echo "aurora_secret_arn=$(echo "$j" | jq -r '.aurora_secret_arn.value // empty')"   >> "$GITHUB_OUTPUT"
+          echo "database_name=$(echo "$j" | jq -r '.database_name.value // "alex"')"          >> "$GITHUB_OUTPUT"
+      - name: Apply migrations + seed
+        if: needs.changes.outputs.apply == 'true' && (steps.tf.outputs.applied == 'true' || needs.changes.outputs.database_sql == 'true')
+        uses: ./.github/actions/db-migrate
+        with:
+          aurora_cluster_arn: ${{ steps.read.outputs.aurora_cluster_arn }}
+          aurora_secret_arn:  ${{ steps.read.outputs.aurora_secret_arn }}
+          database_name:      ${{ steps.read.outputs.database_name }}
+          aws_region:         ${{ env.AWS_REGION }}
+
+  # --------------------------------------------------------------------------
+  # 3. Ingestion — packages backend/ingest then applies terraform/3_ingestion.
+  #     Depends on SageMaker (endpoint name baked into Lambda env).
+  # --------------------------------------------------------------------------
+  ingestion:
+    name: 3 · Ingestion
+    needs: [changes, sagemaker]
+    if: |
+      !cancelled() && needs.sagemaker.result != 'failure' && (
+        needs.changes.outputs.ingest          == 'true' ||
+        needs.changes.outputs.shared_backend  == 'true' ||
+        needs.changes.outputs.ci_self         == 'true' ||
+        needs.sagemaker.outputs.outputs_changed == 'true' ||
+        needs.changes.outputs.full            == 'true' ||
+        contains(needs.changes.outputs.stages, 'ingestion')
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      applied:           ${{ steps.tf.outputs.applied }}
+      outputs_changed:   ${{ steps.tf.outputs.outputs_changed }}
+      api_endpoint:      ${{ steps.read.outputs.api_endpoint }}
+      vector_bucket:     ${{ steps.read.outputs.vector_bucket }}
+      api_key_id:        ${{ steps.read.outputs.api_key_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+          install-uv:            "true"
+      - uses: ./.github/actions/lambda-package
+        with:
+          service:  ingest
+          zip_name: lambda_function.zip
+      - id: tf
+        uses: ./.github/actions/tf-stage
+        with:
+          stage_dir:    terraform/3_ingestion
+          stage_name:   ingestion
+          state_key:    3_ingestion.tfstate
+          state_bucket: ${{ steps.setup.outputs.state_bucket }}
+          aws_region:   ${{ env.AWS_REGION }}
+          apply:        ${{ needs.changes.outputs.apply }}
+          tf_vars_json: |
+            {
+              "aws_region":              "${{ env.AWS_REGION }}",
+              "sagemaker_endpoint_name": "${{ needs.sagemaker.outputs.sagemaker_endpoint_name || 'alex-embedding-endpoint' }}"
+            }
+      - id: read
+        shell: bash
+        env:
+          OUT_JSON: ${{ steps.tf.outputs.outputs_json }}
+        run: |
+          set -euo pipefail
+          j=$(printf '%s' "$OUT_JSON")
+          echo "api_endpoint=$(echo "$j"  | jq -r '.api_endpoint.value      // empty')"  >> "$GITHUB_OUTPUT"
+          echo "vector_bucket=$(echo "$j" | jq -r '.vector_bucket_name.value // empty')" >> "$GITHUB_OUTPUT"
+          echo "api_key_id=$(echo "$j"    | jq -r '.api_key_id.value         // empty')" >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------------------------
+  # 4. Researcher — ECR repo + IAM via terraform, then docker build/push,
+  #     then App Runner via terraform (creates service first time, redeploys after).
+  #     Depends on ingestion (API URL + key flow into runtime env vars).
+  # --------------------------------------------------------------------------
+  researcher:
+    name: 4 · Researcher
+    needs: [changes, ingestion]
+    if: |
+      !cancelled() && needs.ingestion.result != 'failure' && (
+        needs.changes.outputs.researcher_code == 'true' ||
+        needs.changes.outputs.researcher_tf   == 'true' ||
+        needs.changes.outputs.ci_self         == 'true' ||
+        needs.ingestion.outputs.outputs_changed == 'true' ||
+        needs.changes.outputs.full            == 'true' ||
+        contains(needs.changes.outputs.stages, 'researcher')
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      applied:         ${{ steps.tf.outputs.applied }}
+      outputs_changed: ${{ steps.tf.outputs.outputs_changed }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      # Pull the API endpoint/key now (ingestion may not have re-applied this run).
+      - name: Resolve ALEX_API_KEY value
+        id: api_key
+        if: needs.changes.outputs.apply == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ needs.ingestion.outputs.api_key_id }}" ]; then
+            v=$(aws apigateway get-api-key --api-key "${{ needs.ingestion.outputs.api_key_id }}" \
+                  --include-value --query 'value' --output text)
+            echo "::add-mask::$v"
+            echo "value=$v" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ----------------------------------------------------------------------
+      # Stage 4a — Bootstrap ECR ONLY (targeted apply).
+      #
+      # Why: terraform/4_researcher creates both `aws_ecr_repository.researcher`
+      # and `aws_apprunner_service.researcher`. App Runner is created with
+      # `image_identifier = "<repo>:latest"` and AWS validates that the image
+      # tag is reachable at create time. On a first deploy the repo has no
+      # images yet, so a single full `terraform apply` fails on App Runner
+      # with `ImageRepository ... does not exist`.
+      #
+      # Fix: targeted apply of the ECR repo (and any inputs Terraform needs to
+      # compute it) so the image push in Stage 4b has somewhere to land.
+      # On subsequent runs this is a no-op. We don't snapshot/diff here —
+      # Stage 4c is the single source of truth for the stage's outputs.
+      # ----------------------------------------------------------------------
+      - name: Bootstrap ECR (targeted apply)
+        id: bootstrap_ecr
+        if: needs.changes.outputs.apply == 'true'
+        shell: bash
+        working-directory: terraform/4_researcher
+        env:
+          STATE_BUCKET:        ${{ steps.setup.outputs.state_bucket }}
+          AWS_REGION:          ${{ env.AWS_REGION }}
+          TF_VAR_aws_region:   ${{ env.AWS_REGION }}
+          TF_VAR_openai_api_key:    ${{ secrets.OPENAI_API_KEY }}
+          TF_VAR_openai_model:      ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
+          TF_VAR_alex_api_endpoint: ${{ needs.ingestion.outputs.api_endpoint }}
+          TF_VAR_alex_api_key:      ${{ steps.api_key.outputs.value }}
+          TF_VAR_scheduler_enabled: "false"
+        run: |
+          set -euo pipefail
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="key=4_researcher.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+
+          echo "::group::Targeted apply: aws_ecr_repository.researcher"
+          terraform apply -input=false -auto-approve -lock-timeout=5m \
+            -target=aws_ecr_repository.researcher
+          echo "::endgroup::"
+
+          ecr=$(terraform output -raw ecr_repository_url)
+          echo "url=${ecr}" >> "$GITHUB_OUTPUT"
+          echo "ecr_repository_url=${ecr}"
+
+      # On plan-only runs (PRs) we still want to know the ECR URL so the
+      # downstream summary step has something to print. Read it from state
+      # without applying anything.
+      - name: Resolve ECR URL (plan-only path)
+        id: bootstrap_ecr_planonly
+        if: needs.changes.outputs.apply != 'true'
+        shell: bash
+        working-directory: terraform/4_researcher
+        env:
+          STATE_BUCKET: ${{ steps.setup.outputs.state_bucket }}
+          AWS_REGION:   ${{ env.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="key=4_researcher.tfstate" \
+            -backend-config="region=${AWS_REGION}" >/dev/null
+          # May not exist yet on a brand-new repo — empty is fine.
+          ecr=$(terraform output -raw ecr_repository_url 2>/dev/null || true)
+          echo "url=${ecr}" >> "$GITHUB_OUTPUT"
+
+      # Self-heal: if a previous failed run left an App Runner service in a
+      # terminal-bad state (CREATE_FAILED / DELETE_FAILED), delete it now so
+      # the downstream `terraform apply` creates a fresh one against the
+      # image we're about to push. RUNNING / OPERATION_IN_PROGRESS / PAUSED
+      # services are left alone (terraform will reconcile or the redeploy
+      # step inside `researcher-image` will handle them).
+      - name: Reap broken App Runner service
+        if: needs.changes.outputs.apply == 'true'
+        shell: bash
+        env:
+          REGION: ${{ env.AWS_REGION }}
+          SERVICE_NAME: alex-researcher
+        run: |
+          set -euo pipefail
+          arn=$(aws apprunner list-services --region "$REGION" \
+            --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceArn | [0]" \
+            --output text)
+          if [ -z "$arn" ] || [ "$arn" = "None" ]; then
+            echo "No existing App Runner service — nothing to reap."
+            exit 0
+          fi
+          status=$(aws apprunner describe-service --region "$REGION" \
+            --service-arn "$arn" --query 'Service.Status' --output text)
+          echo "Existing App Runner status: $status"
+          case "$status" in
+            CREATE_FAILED|DELETE_FAILED)
+              echo "::warning::Reaping broken App Runner service ($status) so terraform can recreate it."
+              aws apprunner delete-service --region "$REGION" --service-arn "$arn" \
+                --output text >/dev/null
+              # Wait for delete to complete (or for the service to disappear).
+              for i in $(seq 1 60); do
+                s=$(aws apprunner describe-service --region "$REGION" \
+                      --service-arn "$arn" \
+                      --query 'Service.Status' --output text 2>/dev/null || echo "GONE")
+                case "$s" in
+                  GONE|DELETED) echo "✓ service removed"; break ;;
+                  OPERATION_IN_PROGRESS) ;;
+                  *) echo "  status: $s" ;;
+                esac
+                sleep 5
+              done
+              # Drop it from terraform state so the next apply sees an empty
+              # baseline and plans a `+ create`.
+              pushd terraform/4_researcher >/dev/null
+              terraform init -input=false -reconfigure \
+                -backend-config="bucket=${{ steps.setup.outputs.state_bucket }}" \
+                -backend-config="key=4_researcher.tfstate" \
+                -backend-config="region=${REGION}" >/dev/null
+              terraform state rm aws_apprunner_service.researcher 2>/dev/null \
+                || echo "(not in state — fine)"
+              popd >/dev/null
+              ;;
+            *)
+              echo "App Runner not in a broken state — leaving it alone."
+              ;;
+          esac
+
+      # Stage 4b — build & push the docker image. Skipped on plan-only runs.
+      # Action tolerates a missing App Runner service (first deploy) and
+      # silently skips the redeploy step in that case.
+      - name: Build and push researcher image
+        if: needs.changes.outputs.apply == 'true' && steps.bootstrap_ecr.outputs.url != ''
+        uses: ./.github/actions/researcher-image
+        with:
+          ecr_repository_url: ${{ steps.bootstrap_ecr.outputs.url }}
+          aws_region:         ${{ env.AWS_REGION }}
+
+      # Stage 4c — full apply: now that `:latest` exists in ECR, App Runner
+      # can be created (or updated) without the image-not-found error. This
+      # is also the single tf-stage call that owns the stage's snapshot.
+      - id: tf
+        uses: ./.github/actions/tf-stage
+        with:
+          stage_dir:    terraform/4_researcher
+          stage_name:   researcher
+          state_key:    4_researcher.tfstate
+          state_bucket: ${{ steps.setup.outputs.state_bucket }}
+          aws_region:   ${{ env.AWS_REGION }}
+          apply:        ${{ needs.changes.outputs.apply }}
+          tf_vars_json: |
+            {
+              "aws_region":        "${{ env.AWS_REGION }}",
+              "openai_api_key":    "${{ secrets.OPENAI_API_KEY }}",
+              "openai_model":      "${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}",
+              "alex_api_endpoint": "${{ needs.ingestion.outputs.api_endpoint }}",
+              "alex_api_key":      "${{ steps.api_key.outputs.value }}",
+              "scheduler_enabled": "false"
+            }
+
+  # --------------------------------------------------------------------------
+  # 5. Agents — package 5 Lambdas (cached per service hash) + apply terraform/6_agents.
+  #     Depends on database (env ARNs), ingestion (vector bucket name), sagemaker
+  #     (endpoint name baked into Lambda env).
+  # --------------------------------------------------------------------------
+  agents:
+    name: 5 · Agents
+    needs: [changes, sagemaker, database, ingestion]
+    if: |
+      !cancelled() &&
+      needs.database.result  != 'failure' &&
+      needs.sagemaker.result != 'failure' && (
+        needs.changes.outputs.agents_tf        == 'true' ||
+        needs.changes.outputs.agent_planner    == 'true' ||
+        needs.changes.outputs.agent_tagger     == 'true' ||
+        needs.changes.outputs.agent_reporter   == 'true' ||
+        needs.changes.outputs.agent_charter    == 'true' ||
+        needs.changes.outputs.agent_retirement == 'true' ||
+        needs.changes.outputs.shared_backend   == 'true' ||
+        needs.changes.outputs.ci_self          == 'true' ||
+        needs.database.outputs.outputs_changed  == 'true' ||
+        needs.sagemaker.outputs.outputs_changed == 'true' ||
+        needs.ingestion.outputs.outputs_changed == 'true' ||
+        needs.changes.outputs.full             == 'true' ||
+        contains(needs.changes.outputs.stages, 'agents')
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      applied:         ${{ steps.tf.outputs.applied }}
+      outputs_changed: ${{ steps.tf.outputs.outputs_changed }}
+      sqs_queue_url:   ${{ steps.read.outputs.sqs_queue_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+          install-uv:            "true"
+
+      # Package each Lambda (cache hit when nothing in that service changed).
+      - uses: ./.github/actions/lambda-package
+        with: { service: planner }
+      - uses: ./.github/actions/lambda-package
+        with: { service: tagger }
+      - uses: ./.github/actions/lambda-package
+        with: { service: reporter }
+      - uses: ./.github/actions/lambda-package
+        with: { service: charter }
+      - uses: ./.github/actions/lambda-package
+        with: { service: retirement }
+
+      - name: Resolve database outputs (fallback to S3 snapshot)
+        id: dbout
+        shell: bash
+        env:
+          STATE_BUCKET: ${{ steps.setup.outputs.state_bucket }}
+          ARN_FROM_NEEDS: ${{ needs.database.outputs.aurora_cluster_arn }}
+          SECRET_FROM_NEEDS: ${{ needs.database.outputs.aurora_secret_arn }}
+        run: |
+          set -euo pipefail
+          arn="$ARN_FROM_NEEDS"; secret="$SECRET_FROM_NEEDS"
+          if [ -z "$arn" ] || [ -z "$secret" ]; then
+            aws s3 cp "s3://${STATE_BUCKET}/snapshots/database.outputs.json" /tmp/db.json --only-show-errors
+            arn=$(jq -r '.aurora_cluster_arn.value' /tmp/db.json)
+            secret=$(jq -r '.aurora_secret_arn.value' /tmp/db.json)
+          fi
+          echo "aurora_cluster_arn=${arn}"   >> "$GITHUB_OUTPUT"
+          echo "aurora_secret_arn=${secret}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve ingestion vector_bucket (fallback to S3 snapshot)
+        id: vec
+        shell: bash
+        env:
+          STATE_BUCKET: ${{ steps.setup.outputs.state_bucket }}
+          FROM_NEEDS: ${{ needs.ingestion.outputs.vector_bucket }}
+        run: |
+          set -euo pipefail
+          v="$FROM_NEEDS"
+          if [ -z "$v" ]; then
+            aws s3 cp "s3://${STATE_BUCKET}/snapshots/ingestion.outputs.json" /tmp/ing.json --only-show-errors
+            v=$(jq -r '.vector_bucket_name.value' /tmp/ing.json)
+          fi
+          echo "value=${v}" >> "$GITHUB_OUTPUT"
+
+      - id: tf
+        uses: ./.github/actions/tf-stage
+        with:
+          stage_dir:    terraform/6_agents
+          stage_name:   agents
+          state_key:    6_agents.tfstate
+          state_bucket: ${{ steps.setup.outputs.state_bucket }}
+          aws_region:   ${{ env.AWS_REGION }}
+          apply:        ${{ needs.changes.outputs.apply }}
+          tf_vars_json: |
+            {
+              "aws_region":          "${{ env.AWS_REGION }}",
+              "aurora_cluster_arn":  "${{ steps.dbout.outputs.aurora_cluster_arn }}",
+              "aurora_secret_arn":   "${{ steps.dbout.outputs.aurora_secret_arn }}",
+              "vector_bucket":       "${{ steps.vec.outputs.value }}",
+              "sagemaker_endpoint":  "${{ needs.sagemaker.outputs.sagemaker_endpoint_name || 'alex-embedding-endpoint' }}",
+              "polygon_api_key":     "${{ secrets.POLYGON_API_KEY }}",
+              "polygon_plan":        "${{ vars.POLYGON_PLAN || 'free' }}",
+              "openai_api_key":      "${{ secrets.OPENAI_API_KEY }}",
+              "openai_model":        "${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}",
+              "langfuse_public_key": "${{ secrets.LANGFUSE_PUBLIC_KEY }}",
+              "langfuse_secret_key": "${{ secrets.LANGFUSE_SECRET_KEY }}",
+              "langfuse_host":       "${{ secrets.LANGFUSE_HOST }}"
+            }
+
+      - id: read
+        shell: bash
+        env:
+          OUT_JSON: ${{ steps.tf.outputs.outputs_json }}
+        run: |
+          set -euo pipefail
+          v=$(printf '%s' "$OUT_JSON" | jq -r '.sqs_queue_url.value // empty')
+          echo "sqs_queue_url=${v}" >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------------------------
+  # 6. API + Frontend infra — packages backend/api, applies terraform/7_frontend.
+  #     Depends on database (cluster+secret ARNs) and agents (SQS URL).
+  # --------------------------------------------------------------------------
+  api-and-frontend-infra:
+    name: 6 · API + Frontend infra
+    needs: [changes, database, agents]
+    if: |
+      !cancelled() &&
+      needs.database.result != 'failure' &&
+      needs.agents.result   != 'failure' && (
+        needs.changes.outputs.api             == 'true' ||
+        needs.changes.outputs.frontend_tf     == 'true' ||
+        needs.changes.outputs.frontend_assets == 'true' ||
+        needs.changes.outputs.shared_backend  == 'true' ||
+        needs.changes.outputs.ci_self         == 'true' ||
+        needs.database.outputs.outputs_changed == 'true' ||
+        needs.agents.outputs.outputs_changed   == 'true' ||
+        needs.changes.outputs.full            == 'true' ||
+        contains(needs.changes.outputs.stages, 'frontend')
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      applied:                    ${{ steps.tf.outputs.applied }}
+      outputs_changed:            ${{ steps.tf.outputs.outputs_changed }}
+      api_url:                    ${{ steps.read.outputs.api_url }}
+      cloudfront_url:             ${{ steps.read.outputs.cloudfront_url }}
+      cloudfront_distribution_id: ${{ steps.read.outputs.cloudfront_distribution_id }}
+      s3_bucket:                  ${{ steps.read.outputs.s3_bucket }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+          install-uv:            "true"
+
+      - uses: ./.github/actions/lambda-package
+        with: { service: api }
+
+      # Override `terraform_remote_state` data sources baked with backend="local"
+      # in terraform/7_frontend/main.tf so they read from S3 in CI.
+      - id: tf
+        uses: ./.github/actions/tf-stage
+        with:
+          stage_dir:    terraform/7_frontend
+          stage_name:   frontend
+          state_key:    7_frontend.tfstate
+          state_bucket: ${{ steps.setup.outputs.state_bucket }}
+          aws_region:   ${{ env.AWS_REGION }}
+          apply:        ${{ needs.changes.outputs.apply }}
+          tf_vars_json: |
+            {
+              "aws_region":     "${{ env.AWS_REGION }}",
+              "clerk_jwks_url": "${{ secrets.CLERK_JWKS_URL }}",
+              "clerk_issuer":   "${{ secrets.CLERK_ISSUER }}"
+            }
+          override_files_json: |
+            {
+              "_ci_remote_state_override.tf": "data \"terraform_remote_state\" \"database\" {\n  backend = \"s3\"\n  config = {\n    bucket = \"${{ steps.setup.outputs.state_bucket }}\"\n    key    = \"5_database.tfstate\"\n    region = \"${{ env.AWS_REGION }}\"\n  }\n}\n\ndata \"terraform_remote_state\" \"agents\" {\n  backend = \"s3\"\n  config = {\n    bucket = \"${{ steps.setup.outputs.state_bucket }}\"\n    key    = \"6_agents.tfstate\"\n    region = \"${{ env.AWS_REGION }}\"\n  }\n}\n"
+            }
+
+      - id: read
+        shell: bash
+        env:
+          OUT_JSON:    ${{ steps.tf.outputs.outputs_json }}
+          APPLY:       ${{ needs.changes.outputs.apply }}
+          AWS_REGION:  ${{ env.AWS_REGION }}
+        run: |
+          set -euo pipefail
+
+          # Diagnostic — show which top-level keys terraform exposed. Helps
+          # debug "missing output" issues without dumping sensitive values.
+          keys=$(jq -r 'keys | join(", ")' <<< "$OUT_JSON" 2>/dev/null || echo "<unparseable>")
+          echo "::group::terraform outputs (keys only)"
+          echo "stage:  frontend (terraform/7_frontend)"
+          echo "keys:   ${keys}"
+          echo "::endgroup::"
+
+          api_url=$(jq -r '.api_gateway_url.value         // empty' <<< "$OUT_JSON")
+          cf_url=$( jq -r '.cloudfront_url.value          // empty' <<< "$OUT_JSON")
+          cf_id=$(  jq -r '.cloudfront_distribution_id.value // empty' <<< "$OUT_JSON")
+          s3=$(     jq -r '.s3_bucket_name.value          // empty' <<< "$OUT_JSON")
+
+          # Backwards-compat: older state files don't export
+          # cloudfront_distribution_id (it was added in this commit). Fall
+          # back to looking it up by domain name via the AWS CLI.
+          if [ -z "$cf_id" ] && [ -n "$cf_url" ]; then
+            domain=${cf_url#http://}; domain=${domain#https://}; domain=${domain%%/*}
+            cf_id=$(aws cloudfront list-distributions --region "$AWS_REGION" \
+              --query "DistributionList.Items[?DomainName=='${domain}'].Id | [0]" \
+              --output text 2>/dev/null || echo "")
+            [ "$cf_id" = "None" ] && cf_id=""
+          fi
+
+          # On apply runs the stage MUST have produced an s3 bucket and a
+          # cloudfront id — otherwise the assets job will crash with a
+          # cryptic AWS error. Fail here with something actionable.
+          if [ "$APPLY" = "true" ]; then
+            missing=()
+            [ -z "$s3"    ] && missing+=("s3_bucket_name")
+            [ -z "$cf_id" ] && missing+=("cloudfront_distribution_id")
+            [ -z "$api_url" ] && missing+=("api_gateway_url")
+            if [ ${#missing[@]} -gt 0 ]; then
+              echo "::error::terraform/7_frontend ran but produced empty values for: ${missing[*]}."
+              echo "::error::Available output keys: ${keys}"
+              echo "::error::Most likely the stage's state was destroyed or the apply failed silently — re-run with workflow_dispatch full=true."
+              exit 1
+            fi
+          fi
+
+          {
+            echo "api_url=${api_url}"
+            echo "cloudfront_url=${cf_url}"
+            echo "cloudfront_distribution_id=${cf_id}"
+            echo "s3_bucket=${s3}"
+          } >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------------------------
+  # 7. Frontend assets — npm build + S3 sync + CloudFront invalidate.
+  #     Runs whenever the frontend changed OR the API URL / bucket / CF id changed.
+  # --------------------------------------------------------------------------
+  frontend-assets:
+    name: 7 · Frontend assets
+    needs: [changes, api-and-frontend-infra]
+    # Strictly require infra to have SUCCEEDED. Skipped is treated as
+    # "don't deploy assets" because the bucket / CloudFront id we need
+    # come from infra's outputs — and skipped means upstream (database
+    # or agents) failed and infra never ran. To keep the "only frontend
+    # code changed" path working, `frontend_assets` is also a trigger
+    # for the infra job above (no-op via plan when nothing infra-side
+    # actually changed).
+    if: |
+      needs.api-and-frontend-infra.result == 'success' &&
+      needs.changes.outputs.apply == 'true' && (
+        needs.changes.outputs.frontend_assets == 'true' ||
+        needs.changes.outputs.ci_self         == 'true' ||
+        needs.api-and-frontend-infra.outputs.outputs_changed == 'true' ||
+        needs.changes.outputs.full            == 'true' ||
+        contains(needs.changes.outputs.stages, 'frontend')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          aws-role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+          install-node:          "true"
+      - uses: ./.github/actions/frontend-deploy
+        with:
+          s3_bucket:                  ${{ needs.api-and-frontend-infra.outputs.s3_bucket }}
+          cloudfront_distribution_id: ${{ needs.api-and-frontend-infra.outputs.cloudfront_distribution_id }}
+          api_url:                    ${{ needs.api-and-frontend-infra.outputs.api_url }}
+          clerk_publishable_key:      ${{ secrets.CLERK_PUBLISHABLE_KEY }}
+
+  # --------------------------------------------------------------------------
+  # Final summary — convenient single status to require as a branch check.
+  # --------------------------------------------------------------------------
+  summary:
+    name: Summary
+    if: always()
+    needs: [sagemaker, database, ingestion, researcher, agents, api-and-frontend-infra, frontend-assets]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate
+        shell: bash
+        env:
+          CLOUDFRONT_URL: ${{ needs.api-and-frontend-infra.outputs.cloudfront_url }}
+          API_URL:        ${{ needs.api-and-frontend-infra.outputs.api_url }}
+          ASSETS_RESULT:  ${{ needs.frontend-assets.result }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "### Pipeline summary"
+            echo
+            printf "| stage | result |\n|---|---|\n"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for s in sagemaker database ingestion researcher agents api-and-frontend-infra frontend-assets; do
+            r=$(jq -r --arg s "$s" '.[$s].result // "skipped"' <<<'${{ toJson(needs) }}')
+            printf "| %s | %s |\n" "$s" "$r" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          # Surface the deployed URLs so users can jump straight to the site
+          # / API from the Actions run page. Only emit if the values made it
+          # through the cascade (api-and-frontend-infra ran and produced
+          # outputs).
+          if [ -n "${CLOUDFRONT_URL}" ] || [ -n "${API_URL}" ]; then
+            {
+              echo
+              echo "### Deployed endpoints"
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            if [ -n "${CLOUDFRONT_URL}" ]; then
+              # Add a note when assets weren't (re)deployed this run so the
+              # link is still useful but clearly stale-tolerant.
+              note=""
+              case "${ASSETS_RESULT}" in
+                success) note="" ;;
+                skipped) note=" _(assets unchanged this run)_" ;;
+                *)       note=" _(assets job: ${ASSETS_RESULT})_" ;;
+              esac
+              printf -- "- 🌐 **Frontend:** [%s](%s)%s\n" \
+                "${CLOUDFRONT_URL}" "${CLOUDFRONT_URL}" "${note}" \
+                >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            if [ -n "${API_URL}" ]; then
+              printf -- "- 🔌 **API:** \`%s\`\n" "${API_URL}" \
+                >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            # Console-friendly mirror so the URLs are also visible in the raw log.
+            echo
+            echo "Deployed endpoints:"
+            [ -n "${CLOUDFRONT_URL}" ] && echo "  Frontend: ${CLOUDFRONT_URL}"
+            [ -n "${API_URL}"        ] && echo "  API:      ${API_URL}"
+          fi
+
+          # Fail the summary only if any required job actually failed (skipped is OK).
+          fail=0
+          for s in sagemaker database ingestion researcher agents api-and-frontend-infra frontend-assets; do
+            r=$(jq -r --arg s "$s" '.[$s].result // "skipped"' <<<'${{ toJson(needs) }}')
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then fail=1; fi
+          done
+          exit $fail

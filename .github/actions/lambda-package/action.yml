@@ -1,0 +1,112 @@
+name: Package Lambda zip
+description: |
+  Packages a single backend service into a Lambda zip via `uv run package_docker.py`.
+  Caches the resulting zip keyed by the hash of the service code + shared backend
+  files so an unchanged service is restored from cache instead of rebuilt.
+
+inputs:
+  service:
+    description: Service directory under `backend/` (e.g. planner, api, ingest).
+    required: true
+  zip_name:
+    description: |
+      Name of the produced zip file inside `backend/<service>/`.
+      Defaults to `<service>_lambda.zip`. The `ingest` service uses
+      `lambda_function.zip` (set explicitly).
+    required: false
+    default: ""
+  shared_paths:
+    description: |
+      Newline-separated list of additional paths whose hashes should bust the
+      cache (typically shared backend code or the root lockfile).
+    required: false
+    default: |
+      backend/pyproject.toml
+      backend/uv.lock
+
+outputs:
+  zip_path:
+    description: Path to the produced Lambda zip relative to the repo root.
+    value: ${{ steps.resolve.outputs.path }}
+  cache_hit:
+    description: "true if the zip was restored from cache."
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve zip name
+      id: resolve
+      shell: bash
+      run: |
+        set -euo pipefail
+        name="${{ inputs.zip_name }}"
+        if [ -z "$name" ]; then
+          name="${{ inputs.service }}_lambda.zip"
+        fi
+        path="backend/${{ inputs.service }}/${name}"
+        echo "name=${name}" >> "$GITHUB_OUTPUT"
+        echo "path=${path}" >> "$GITHUB_OUTPUT"
+
+    - name: Compute cache key
+      id: key
+      shell: bash
+      env:
+        SHARED_PATHS: ${{ inputs.shared_paths }}
+      run: |
+        set -euo pipefail
+        # Stable hash over: service files + shared paths + this action.
+        # Using sha256 of concatenated git blobs gives a deterministic key per content.
+        files=()
+        while IFS= read -r line; do
+          [ -z "$line" ] && continue
+          files+=("$line")
+        done <<< "$SHARED_PATHS"
+        files+=("backend/${{ inputs.service }}")
+
+        # Use git ls-files to enumerate tracked files only (avoids node_modules-like noise).
+        list=$(git -C "$GITHUB_WORKSPACE" ls-files -- "${files[@]}" | sort)
+        if [ -z "$list" ]; then
+          echo "no tracked files matched for ${{ inputs.service }}" >&2
+          exit 1
+        fi
+        hash=$(echo "$list" | xargs -I {} sh -c 'git -C "$GITHUB_WORKSPACE" hash-object "{}"' | sha256sum | awk '{print $1}')
+        echo "value=lambda-${{ inputs.service }}-${hash}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore Lambda zip from cache
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.resolve.outputs.path }}
+        key: ${{ steps.key.outputs.value }}
+
+    - name: Build Lambda zip
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: backend/${{ inputs.service }}
+      run: |
+        set -euo pipefail
+        uv sync
+        if [ "${{ inputs.service }}" = "ingest" ] || [ -f package.py ]; then
+          # ingest still uses package.py (no Docker) per Guide 3
+          uv run package.py
+        else
+          uv run package_docker.py
+        fi
+        if [ ! -f "${{ steps.resolve.outputs.name }}" ]; then
+          echo "expected zip not found: ${{ steps.resolve.outputs.name }}" >&2
+          ls -la
+          exit 1
+        fi
+
+    - name: Summarise
+      shell: bash
+      run: |
+        size=$(stat -c %s "${{ steps.resolve.outputs.path }}" 2>/dev/null || stat -f %z "${{ steps.resolve.outputs.path }}")
+        {
+          echo "### Lambda package · ${{ inputs.service }}"
+          echo
+          echo "- zip: \`${{ steps.resolve.outputs.path }}\`"
+          echo "- cache hit: \`${{ steps.cache.outputs.cache-hit }}\`"
+          echo "- size: \`${size}\` bytes"
+        } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,71 @@
+name: S3 empty
+description: |
+  Empties an S3 bucket (including all object versions and delete markers) so
+  that a subsequent `terraform destroy` can succeed. Idempotent: if the
+  bucket does not exist, the action exits 0 with a notice.
+
+  This is needed because none of Alex's data buckets set `force_destroy = true`
+  on `aws_s3_bucket`, and Terraform refuses to delete non-empty buckets.
+
+inputs:
+  bucket:
+    description: Name of the S3 bucket to empty. Empty string skips the action.
+    required: true
+  fail_if_missing:
+    description: |
+      If "true", error out when the bucket does not exist. Default "false"
+      so destroys remain safe to re-run after a partial teardown.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Empty bucket
+      shell: bash
+      env:
+        BUCKET: ${{ inputs.bucket }}
+        FAIL_IF_MISSING: ${{ inputs.fail_if_missing }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${BUCKET}" ]; then
+          echo "::notice::no bucket name supplied — nothing to empty."
+          exit 0
+        fi
+
+        if ! aws s3api head-bucket --bucket "${BUCKET}" 2>/dev/null; then
+          if [ "${FAIL_IF_MISSING}" = "true" ]; then
+            echo "::error::bucket ${BUCKET} does not exist."
+            exit 1
+          fi
+          echo "::notice::bucket ${BUCKET} does not exist — skipping."
+          exit 0
+        fi
+
+        echo "Emptying s3://${BUCKET} (current objects)…"
+        aws s3 rm "s3://${BUCKET}" --recursive --only-show-errors || true
+
+        # Versioned buckets keep prior versions and delete markers — purge them too.
+        echo "Purging object versions and delete markers in s3://${BUCKET}…"
+        while :; do
+          payload=$(aws s3api list-object-versions --bucket "${BUCKET}" \
+            --max-items 1000 \
+            --query '{Objects: (Versions || `[]`)[].{Key:Key,VersionId:VersionId}, Markers: (DeleteMarkers || `[]`)[].{Key:Key,VersionId:VersionId}}' \
+            --output json 2>/dev/null || echo '{"Objects":[],"Markers":[]}')
+
+          objects=$(echo "$payload" | jq -c '.Objects // []')
+          markers=$(echo "$payload" | jq -c '.Markers // []')
+          combined=$(echo "$payload" | jq -c '((.Objects // []) + (.Markers // []))')
+          count=$(echo "$combined" | jq 'length')
+
+          if [ "$count" = "0" ]; then break; fi
+
+          # delete-objects accepts up to 1000 keys per call.
+          echo "  deleting batch of ${count} versions/markers…"
+          aws s3api delete-objects --bucket "${BUCKET}" \
+            --delete "$(jq -c --argjson o "$combined" -n '{Objects:$o, Quiet:true}')" \
+            --output json >/dev/null
+        done
+
+        echo "✓ s3://${BUCKET} is empty."

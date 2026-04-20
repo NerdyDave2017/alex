@@ -1,0 +1,129 @@
+name: Setup
+description: |
+  Common setup for every CI job: AWS credentials (OIDC by default, static
+  keys as fallback), Terraform, uv, Node (optional), and resolves the AWS
+  account ID into env so downstream steps can build the Terraform state
+  bucket name (`alex-terraform-state-<accountId>`).
+
+inputs:
+  aws-region:
+    description: Default AWS region for the AWS CLI / providers.
+    required: true
+  aws-role-to-assume:
+    description: |
+      ARN of the IAM role to assume via GitHub OIDC. When set, the action
+      authenticates without static keys (preferred). Caller must include
+      `permissions: { id-token: write }` at the workflow or job level.
+    required: false
+    default: ""
+  aws-role-session-name:
+    description: Session name when assuming an OIDC role.
+    required: false
+    default: github-actions-alex-cicd
+  aws-access-key-id:
+    description: Static AWS access key ID. Only used when aws-role-to-assume is empty.
+    required: false
+    default: ""
+  aws-secret-access-key:
+    description: Static AWS secret access key. Only used when aws-role-to-assume is empty.
+    required: false
+    default: ""
+  terraform-version:
+    description: Terraform CLI version.
+    required: false
+    default: "1.9.0"
+  install-node:
+    description: Set to "true" to install Node.js (for the frontend stage).
+    required: false
+    default: "false"
+  node-version:
+    description: Node.js version (when install-node=true).
+    required: false
+    default: "20"
+  install-uv:
+    description: Set to "true" to install uv (for stages that build Lambda zips).
+    required: false
+    default: "false"
+
+outputs:
+  account_id:
+    description: The AWS account ID resolved from the configured credentials.
+    value: ${{ steps.account.outputs.id }}
+  state_bucket:
+    description: The Terraform state / output-snapshot bucket name.
+    value: ${{ steps.account.outputs.state_bucket }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate auth inputs
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.aws-role-to-assume }}" ] \
+        && { [ -z "${{ inputs.aws-access-key-id }}" ] || [ -z "${{ inputs.aws-secret-access-key }}" ]; }; then
+          echo "::error::Provide either aws-role-to-assume (OIDC, preferred) or aws-access-key-id + aws-secret-access-key."
+          exit 1
+        fi
+
+    # NOTE: `mask-aws-account-id` is intentionally OFF.
+    #
+    # When set to true the action registers the account ID as a masked
+    # secret. GitHub then refuses to pass any step output value that
+    # contains a registered secret to downstream steps and silently
+    # replaces it with an empty string ("Skip output X since it may
+    # contain secret"). Several Terraform stages embed the account ID
+    # in resource names (e.g. the frontend S3 bucket
+    # `alex-frontend-${account_id}`, the state bucket
+    # `alex-terraform-state-${account_id}`), and those outputs need to
+    # flow between jobs. Masking the account ID breaks that pipeline.
+    #
+    # AWS itself does not classify account IDs as secrets — they appear
+    # in every IAM ARN, every error message, every CloudTrail event, and
+    # every Terraform plan/apply log. Leaving this off matches AWS's own
+    # security guidance and unblocks the inter-job output cascade.
+    - name: Configure AWS credentials (OIDC)
+      if: inputs.aws-role-to-assume != ''
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.aws-role-to-assume }}
+        role-session-name: ${{ inputs.aws-role-session-name }}
+        aws-region: ${{ inputs.aws-region }}
+        mask-aws-account-id: false
+
+    - name: Configure AWS credentials (static keys fallback)
+      if: inputs.aws-role-to-assume == ''
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ inputs.aws-access-key-id }}
+        aws-secret-access-key: ${{ inputs.aws-secret-access-key }}
+        aws-region: ${{ inputs.aws-region }}
+        mask-aws-account-id: false
+
+    - name: Resolve AWS account ID and state bucket
+      id: account
+      shell: bash
+      run: |
+        set -euo pipefail
+        id="$(aws sts get-caller-identity --query Account --output text)"
+        echo "id=${id}" >> "$GITHUB_OUTPUT"
+        echo "state_bucket=alex-terraform-state-${id}" >> "$GITHUB_OUTPUT"
+        echo "AWS_ACCOUNT_ID=${id}" >> "$GITHUB_ENV"
+        echo "TF_STATE_BUCKET=alex-terraform-state-${id}" >> "$GITHUB_ENV"
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        terraform_wrapper: false
+
+    - name: Setup uv
+      if: inputs.install-uv == 'true'
+      uses: astral-sh/setup-uv@v5
+
+    - name: Setup Node.js
+      if: inputs.install-node == 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+        cache-dependency-path: frontend/package-lock.json
